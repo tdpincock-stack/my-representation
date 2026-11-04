@@ -255,10 +255,14 @@ console.log(
   'HOUSE VOTE DEBUG:',
   JSON.stringify(records.slice(0, 2))
 );
-      const person = records.find(record =>
-        record.bioguideId === id ||
-        record.member?.bioguideId === id
-      );
+      
+const person = records.find(record =>
+  record.bioguideID === id ||
+  record.bioguideId === id ||
+  record.member?.bioguideID === id ||
+  record.member?.bioguideId === id
+);
+
 
       if (!person) {
         console.error(
