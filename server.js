@@ -251,10 +251,7 @@ app.get('/api/votes', handler(async req => {
       }
 
       checked++;
-console.log(
-  'HOUSE VOTE DEBUG:',
-  JSON.stringify(records.slice(0, 2))
-);
+
       
 const person = records.find(record =>
   record.bioguideID === id ||
