@@ -9,5 +9,82 @@ function renderMembers(){const holder=$('#members');holder.replaceChildren();for
 function renderVotes(){const q=$('#search').value.toLowerCase();const visible=state.votes.filter(v=>(v.question+' '+v.description+' '+v.result).toLowerCase().includes(q));$('#voteList').innerHTML=visible.length?visible.map(v=>{const rating=state.ratings[v.id];return `<article class="record"><div class="meta">${esc(v.chamber)} · Roll call ${esc(v.number)} · ${esc(v.date)}</div><h3>${esc(v.description||v.question||'Recorded vote')}</h3><p>${esc(v.question)} · Result: ${esc(v.result||'See official record')}</p><span class="pill">Representative voted: ${esc(v.position)}</span><div class="actions"><a href="${esc(v.url)}" target="_blank" rel="noopener">Official voting record ↗</a><button data-rate="agree" data-id="${esc(v.id)}" class="${rating==='agree'?'chosen':''}">I agree</button><button data-rate="disagree" data-id="${esc(v.id)}" class="${rating==='disagree'?'chosen':''}">I disagree</button><button data-rate="unsure" data-id="${esc(v.id)}" class="${rating==='unsure'?'chosen':''}">Unsure</button></div></article>`}).join(''):'<p class="sub">No matching recorded votes in the recent sample. Try another representative or keyword.</p>';$('#voteList').querySelectorAll('[data-rate]').forEach(b=>b.onclick=()=>{state.ratings[b.dataset.id]=b.dataset.rate;localStorage.setItem('mr_ratings',JSON.stringify(state.ratings));alignment();renderVotes()})}
 async function loadVotes(){const m=state.members.find(m=>m.id===$('#memberSelect').value);if(!m)return;$('#voteList').innerHTML='<p class="sub">Loading recent official roll calls…</p>';$('#voteNote').textContent='';try{const chamber=m.chamber.includes('Senate')?'senate':'house';const last=m.name.split(' ').at(-1).replace(/[^a-zA-Z-]/g,'');const p=new URLSearchParams({id:m.id,chamber,name:m.name,last,state:m.state});const d=await api('/api/votes?'+p);state.votes=d.votes;$('#voteNote').textContent=d.notice+' Records are not a comprehensive voting history.';renderVotes()}catch(e){$('#voteList').innerHTML=`<p class="sub">${esc(e.message)}. Try again later or use the member's official profile.</p>`}}
 async function loadBills(){const m=state.members.find(m=>m.id===$('#billMember').value);if(!m)return;$('#billList').innerHTML='<p class="sub">Loading sponsored legislation…</p>';try{const d=await api('/api/sponsored/'+encodeURIComponent(m.id));$('#billList').innerHTML=d.bills.length?d.bills.map(b=>`<article class="record"><div class="meta">${esc(b.type)} ${esc(b.number)} · ${esc(b.congress)}th Congress</div><h3>${esc(b.title)}</h3><p>${esc(b.latestAction||'No recent action supplied')} · ${esc(b.date||'')}</p><a target="_blank" rel="noopener" href="https://www.congress.gov/search?q=${encodeURIComponent(JSON.stringify({source:'legislation',search:`${b.type} ${b.number} ${b.congress}`}))}">Find on Congress.gov ↗</a></article>`).join(''):'<p class="sub">No sponsored bills returned by the source.</p>'}catch(e){$('#billList').innerHTML=`<p class="sub">${esc(e.message)}</p>`}}
-$('#lookup').onsubmit=async e=>{e.preventDefault();status('Finding your congressional district and representatives…');$('#dashboard').hidden=true;try{const loc=await api('/api/location?address='+encodeURIComponent($('#address').value));const d=await api(`/api/members?state=${loc.state}&district=${loc.district}`);if(!d.members.length)throw Error('No current members returned for this district. Please verify the address or try again.');state.members=d.members;$('#where').textContent=`${loc.state} · Congressional District ${loc.district}`;$('#matched').textContent=`Census matched: ${loc.matchedAddress}`;renderMembers();memberOptions();$('#dashboard').hidden=false;status('');await loadVotes()}catch(err){status(err.message,true)}};
+
+$('#lookup').onsubmit = async e => {
+  e.preventDefault();
+
+  status('Finding your congressional district and representatives…');
+  $('#dashboard').hidden = true;
+
+  try {
+    const address = $('#address').value.trim();
+
+    const loc = await api(
+      '/api/location?address=' + encodeURIComponent(address)
+    );
+
+    // Fallback locations must be confirmed by the visitor.
+    if (loc.confirmationRequired) {
+      const score = Number(loc.matchScore);
+      const matchQuality = Number.isFinite(score)
+        ? `Match score: ${score.toFixed(0)}/100\n`
+        : '';
+
+      const message =
+        'We could not match your address directly with the Census Bureau.\n\n' +
+        'Another address service found this location:\n\n' +
+        loc.matchedAddress + '\n\n' +
+        matchQuality +
+        `Possible congressional district: ${loc.state}-${loc.district}\n\n` +
+        'Does this location match your intended address?\n\n' +
+        'Select OK to continue or Cancel to try another address.';
+
+      const confirmed = window.confirm(message);
+
+      if (!confirmed) {
+        status(
+          'Location not confirmed. Please check your address and try again.'
+        );
+        $('#address').focus();
+        return;
+      }
+    }
+
+    const d = await api(
+      `/api/members?state=${encodeURIComponent(loc.state)}` +
+      `&district=${encodeURIComponent(loc.district)}`
+    );
+
+    if (!d.members.length) {
+      throw Error(
+        'No current members returned for this district. ' +
+        'Please verify the address or try again.'
+      );
+    }
+
+    state.members = d.members;
+
+    $('#where').textContent =
+      `${loc.state} · Congressional District ${loc.district}`;
+
+    const sourceLabel = loc.confirmationRequired
+      ? 'Location confirmed using fallback geocoding'
+      : 'Census matched';
+
+    $('#matched').textContent =
+      `${sourceLabel}: ${loc.matchedAddress}`;
+
+    renderMembers();
+    memberOptions();
+
+    $('#dashboard').hidden = false;
+    status('');
+
+    await loadVotes();
+
+  } catch (err) {
+    status(err.message, true);
+  }
+};
+
 $('#memberSelect').onchange=loadVotes;$('#billMember').onchange=loadBills;$('#search').oninput=renderVotes;$('#change').onclick=()=>{$('#dashboard').hidden=true;$('#address').focus();window.scrollTo({top:0,behavior:'smooth'})};document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('selected',x===b));['votes','bills','about'].forEach(t=>$('#'+t+'Tab').hidden=b.dataset.tab!==t);if(b.dataset.tab==='bills')loadBills()});renderTopics();alignment();
