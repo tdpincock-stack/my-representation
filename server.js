@@ -162,8 +162,166 @@ app.get('/api/location', handler(async req => {
 app.get('/api/members',handler(async req=>{const state=String(req.query.state||'').toUpperCase(),district=Number(req.query.district);if(!stateCodes.has(state)||!Number.isInteger(district)||district<0||district>53)throw Error('Invalid state or district.');const d=await congress(`/member/${state}?currentMember=true&limit=250`);const members=(d.members||[]).filter(m=>m.currentMember!==false).filter(m=>{const terms=m.terms?.item||[];const latest=terms.at(-1);const chamber=(latest?.chamber||'').toLowerCase();return chamber==='senate'||(chamber==='house of representatives'&&Number(m.district??latest?.district)===district)});return {members:members.map(m=>({id:m.bioguideId,name:m.name||m.directOrderName||m.fullName,party:m.party,state:m.state,district:m.district,chamber:(m.terms?.item||[]).at(-1)?.chamber||'',image:m.depiction?.imageUrl||null,profile:`https://www.congress.gov/member/${m.bioguideId}`})),source:'Congress.gov',retrievedAt:new Date().toISOString()}}));
 app.get('/api/sponsored/:id',handler(async req=>{const id=req.params.id;if(!/^[A-Z]\d{6}$/.test(id))throw Error('Invalid Bioguide ID');const d=await congress(`/member/${id}/sponsored-legislation?limit=20`);return {bills:(d.sponsoredLegislation||[]).map(b=>({title:b.title,number:b.number,type:b.type,congress:b.congress,url:b.url?.replace('api.congress.gov/v3/bill/','www.congress.gov/bill/')||null,latestAction:b.latestAction?.text,date:b.latestAction?.actionDate})),source:'Congress.gov'}}));
 function array(v){return v==null?[]:Array.isArray(v)?v:[v]}function text(v){return typeof v==='object'?(v?.['#text']??''):v??''}
-app.get('/api/votes',handler(async req=>{const chamber=String(req.query.chamber||'house').toLowerCase();const id=String(req.query.id||'');if(!/^[A-Z]\d{6}$/.test(id))throw Error('Invalid member ID');const congress=currentCongress(),sess=session();const votes=[];
-if(chamber==='house'){
+
+app.get('/api/votes', handler(async req => {
+  const chamber = String(req.query.chamber || 'house').toLowerCase();
+  const id = String(req.query.id || '');
+  const congressNumber = currentCongress();
+  const sess = session();
+
+  if (!/^[A-Z]\d{6}$/.test(id)) {
+    throw Error('Invalid member ID');
+  }
+
+  // Keep the existing Senate implementation separate for now.
+  if (chamber === 'senate') {
+    throw Error(
+      'Senate voting records are temporarily unavailable while we update the data source.'
+    );
+  }
+
+  if (chamber !== 'house') {
+    throw Error('Invalid chamber');
+  }
+
+  const listing = await congressRequest(
+    `/house-vote/${congressNumber}/${sess}?limit=10`
+  );
+
+  const entries = listing.houseRollCallVotes
+    || listing.houseVotes
+    || [];
+
+  if (!Array.isArray(entries)) {
+    throw Error('Unexpected House vote listing format.');
+  }
+
+  if (entries.length === 0) {
+    return {
+      votes: [],
+      checked: 0,
+      failed: 0,
+      source: 'Congress.gov',
+      notice: 'The source returned no House roll calls for this session.'
+    };
+  }
+
+  const votes = [];
+  let failed = 0;
+  let checked = 0;
+
+  // Only inspect five votes initially.
+  // Process sequentially to avoid overwhelming the API.
+  for (const item of entries.slice(0, 5)) {
+    const num = item.rollCallNumber
+      ?? item.voteNumber
+      ?? item.number;
+
+    if (num == null) {
+      failed++;
+      console.error('House vote: missing roll call number');
+      continue;
+    }
+
+    try {
+      const base =
+        `/house-vote/${congressNumber}/${sess}/${num}`;
+
+      const detail = await congressRequest(base);
+
+      const memberData = await congressRequest(
+        `${base}/members?limit=500`
+      );
+
+      const vote = detail.houseRollCallVote
+        || detail.houseVote
+        || {};
+
+      const container =
+        memberData.houseRollCallVoteMemberVotes
+        || memberData.members
+        || [];
+
+      const records = Array.isArray(container)
+        ? container
+        : container.results || container.members || [];
+
+      if (!Array.isArray(records)) {
+        throw Error('Unexpected member voting data format.');
+      }
+
+      checked++;
+
+      const person = records.find(record =>
+        record.bioguideId === id ||
+        record.member?.bioguideId === id
+      );
+
+      if (!person) {
+        console.error(
+          `House vote ${num}: member ${id} not found in returned records`
+        );
+        continue;
+      }
+
+      votes.push({
+        id: `house-${congressNumber}-${sess}-${num}`,
+        chamber: 'House',
+        number: num,
+        date: vote.startDate
+          || vote.date
+          || item.startDate
+          || '',
+        question: vote.voteQuestion
+          || vote.question
+          || item.voteQuestion
+          || 'Roll call vote',
+        description: vote.voteDescription
+          || vote.description
+          || item.voteDescription
+          || '',
+        result: vote.result
+          || vote.voteResult
+          || '',
+        position: person.voteCast
+          || person.vote
+          || person.position
+          || 'Unknown',
+        url: `https://clerk.house.gov/Votes/${new Date().getUTCFullYear()}${String(num).padStart(3, '0')}`
+      });
+
+    } catch (error) {
+      failed++;
+      console.error(`House vote ${num}: ${error.message}`);
+    }
+  }
+
+  // Do not report an API failure as an absence of voting records.
+  if (checked === 0 && failed > 0) {
+    throw Error(
+      `House voting data could not be retrieved. ${failed} lookups failed.`
+    );
+  }
+
+  if (votes.length === 0 && checked > 0) {
+    throw Error(
+      'Vote records were retrieved, but this representative could not be matched. The voting data format may need updating.'
+    );
+  }
+
+  votes.sort((a, b) => Number(b.number) - Number(a.number));
+
+  return {
+    votes,
+    checked,
+    failed,
+    source: 'Congress.gov',
+    notice:
+      `Checked ${checked} recent House roll calls. ` +
+      `${failed} lookups failed. ` +
+      'This is a limited sample, not a complete voting history.'
+  };
+}));
 
 const listing=await congressRequest(`/house-vote/${congress}/${sess}?limit=35`);const entries=listing.houseRollCallVotes||listing.houseVotes||[];
  await Promise.all(entries.slice(0,22).map(async v=>{try{const num=v.rollCallNumber??v.voteNumber??v.number;const [detail,memberData]=await Promise.all([congressRequest(`/house-vote/${congress}/${sess}/${num}`),congressRequest(`/house-vote/${congress}/${sess}/${num}/members?limit=500`)]);const vote=detail.houseRollCallVote||detail.houseVote||{};const records=memberData.houseRollCallVoteMemberVotes?.results||memberData.houseRollCallVoteMemberVotes||memberData.members||[];const person=array(records).find(x=>x.bioguideId===id||x.member?.bioguideId===id);if(person)votes.push({id:`house-${congress}-${sess}-${num}`,chamber:'House',number:num,date:vote.startDate||vote.date||v.startDate||'',question:vote.voteQuestion||vote.question||v.voteQuestion||'Roll call vote',description:vote.voteDescription||vote.description||v.voteDescription||'',result:vote.result||vote.voteResult||'',position:person.voteCast||person.vote||person.position||'Unknown',url:`https://clerk.house.gov/Votes/${new Date().getUTCFullYear()}${String(num).padStart(3,'0')}`})}catch(e){console.error('House vote',e.message)}}));
