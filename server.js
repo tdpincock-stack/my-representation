@@ -188,9 +188,15 @@ app.get('/api/votes', handler(async req => {
     `/house-vote/${congressNumber}/${sess}?limit=10`
   );
 
-  const entries = listing.houseRollCallVotes
-    || listing.houseVotes
-    || [];
+  
+const entries = [
+  ...(listing.houseRollCallVotes || listing.houseVotes || [])
+].sort((a, b) => {
+  const dateA = Date.parse(a.startDate || '') || 0;
+  const dateB = Date.parse(b.startDate || '') || 0;
+  return dateB - dateA;
+});
+
 
   if (!Array.isArray(entries)) {
     throw Error('Unexpected House vote listing format.');
