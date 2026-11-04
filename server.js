@@ -7,7 +7,158 @@ function congress(path){if(!process.env.CONGRESS_API_KEY)throw Error('CONGRESS_A
 function handler(fn){return async(req,res)=>{try{res.json(await fn(req))}catch(e){console.error(e.message);res.status(502).json({error:e.message})}}}
 const stateCodes=new Set('AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC'.split(' '));
 function currentCongress(){return Math.floor((new Date().getUTCFullYear()-2025)/2)+119}function session(){return new Date().getUTCFullYear()%2===1?1:2}
-app.get('/api/location',handler(async req=>{const address=String(req.query.address||'').trim();if(address.length<8||address.length>250)throw Error('Enter a complete U.S. street address (8–250 characters).');const url=new URL('https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress');url.search=new URLSearchParams({address,benchmark:'Public_AR_Current',vintage:'Current_Current',format:'json'});const d=await get(url.toString(),86400000);const match=d.result?.addressMatches?.[0];if(!match)throw Error('Address not found. Include street, city, state and ZIP.');const districts=Object.entries(match.geographies||{}).filter(([k])=>/congressional districts/i.test(k)).flatMap(([,v])=>v);const district= districts.find(x=>x.CD119!==undefined||x.CD118!==undefined||x.BASENAME)||districts[0];const state=(match.addressComponents?.state||'').toUpperCase();if(!stateCodes.has(state))throw Error('Could not determine the state.');const number=district?.CD119??district?.CD118??district?.BASENAME??district?.CD; if(number===undefined)throw Error('Census did not return a congressional district for this address.');return {state,district:Number(number),matchedAddress:match.matchedAddress,congress:currentCongress(),districtSource:Object.keys(match.geographies||{}).filter(k=>/congressional districts/i.test(k))}}));
+
+function findDistrict(geographies) {
+  const groups = Object.entries(geographies || {})
+    .filter(([name]) => /congressional districts/i.test(name))
+    .flatMap(([, items]) => Array.isArray(items) ? items : []);
+
+  const current = groups.find(d => d.CD119 !== undefined)
+    || groups.find(d => d.CD118 !== undefined)
+    || groups[0];
+
+  const raw = current?.CD119 ?? current?.CD118
+    ?? current?.BASENAME ?? current?.CD;
+
+  if (raw === undefined || raw === null) {
+    throw Error('No congressional district was returned for this location.');
+  }
+
+  const district = Number(raw);
+  if (!Number.isInteger(district) || district < 0 || district > 53) {
+    throw Error('The congressional district result was invalid.');
+  }
+
+  return district;
+}
+
+app.get('/api/location', handler(async req => {
+  const address = String(req.query.address || '').trim();
+
+  if (address.length < 8 || address.length > 250) {
+    throw Error('Enter a complete U.S. street address (8–250 characters).');
+  }
+
+  const censusUrl = new URL(
+    'https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress'
+  );
+
+  censusUrl.search = new URLSearchParams({
+    address,
+    benchmark: 'Public_AR_Current',
+    vintage: 'Current_Current',
+    format: 'json'
+  });
+
+  let censusResult;
+
+  try {
+    censusResult = await get(censusUrl.toString(), 86400000);
+  } catch (error) {
+    console.error('Census address lookup failed:', error.message);
+  }
+
+  const match = censusResult?.result?.addressMatches?.[0];
+
+  if (match) {
+    const state = String(match.addressComponents?.state || '').toUpperCase();
+
+    if (!stateCodes.has(state)) {
+      throw Error('Could not determine the state.');
+    }
+
+    return {
+      state,
+      district: findDistrict(match.geographies),
+      matchedAddress: match.matchedAddress,
+      congress: currentCongress(),
+      confirmationRequired: false,
+      lookupMethod: 'census-address'
+    };
+  }
+
+  // Fallback: geocode the address using ArcGIS.
+  const arcUrl = new URL(
+    'https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates'
+  );
+
+  arcUrl.search = new URLSearchParams({
+    SingleLine: address,
+    f: 'json',
+    outFields: 'Addr_type,RegionAbbr,Country',
+    sourceCountry: 'USA',
+    maxLocations: '1',
+    forStorage: 'false'
+  });
+
+  const arcResult = await get(arcUrl.toString(), 86400000);
+
+  if (arcResult.error) {
+    throw Error('The fallback address service is unavailable.');
+  }
+
+  const candidate = arcResult.candidates?.[0];
+
+  if (!candidate || candidate.score < 85) {
+    throw Error(
+      'Neither address service found a reliable match. Please verify your address.'
+    );
+  }
+
+  const type = candidate.attributes?.Addr_type;
+
+  if (!['PointAddress', 'Subaddress', 'StreetAddress'].includes(type)) {
+    throw Error(
+      'Only an approximate street or area was found. Please use a more precise address.'
+    );
+  }
+
+  const latitude = Number(candidate.location?.y);
+  const longitude = Number(candidate.location?.x);
+
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    throw Error('The fallback service did not return valid coordinates.');
+  }
+
+  const coordUrl = new URL(
+    'https://geocoding.geo.census.gov/geocoder/geographies/coordinates'
+  );
+
+  coordUrl.search = new URLSearchParams({
+    x: String(longitude),
+    y: String(latitude),
+    benchmark: 'Public_AR_Current',
+    vintage: 'Current_Current',
+    format: 'json'
+  });
+
+  const coordinateResult = await get(coordUrl.toString(), 86400000);
+  const geographies = coordinateResult?.result?.geographies;
+
+  const states = Object.entries(geographies || {})
+    .filter(([name]) => /^states$/i.test(name))
+    .flatMap(([, values]) => Array.isArray(values) ? values : []);
+
+  const state = String(
+    candidate.attributes?.RegionAbbr || states[0]?.STUSAB || ''
+  ).toUpperCase();
+
+  if (!stateCodes.has(state)) {
+    throw Error('Could not determine the state from the fallback location.');
+  }
+
+  return {
+    state,
+    district: findDistrict(geographies),
+    matchedAddress: candidate.address,
+    congress: currentCongress(),
+    confirmationRequired: true,
+    lookupMethod: 'arcgis-coordinates',
+    matchScore: candidate.score,
+    matchType: type,
+    approximateLocation: { latitude, longitude }
+  };
+}));
 app.get('/api/members',handler(async req=>{const state=String(req.query.state||'').toUpperCase(),district=Number(req.query.district);if(!stateCodes.has(state)||!Number.isInteger(district)||district<0||district>53)throw Error('Invalid state or district.');const d=await congress(`/member/${state}?currentMember=true&limit=250`);const members=(d.members||[]).filter(m=>m.currentMember!==false).filter(m=>{const terms=m.terms?.item||[];const latest=terms.at(-1);const chamber=(latest?.chamber||'').toLowerCase();return chamber==='senate'||(chamber==='house of representatives'&&Number(m.district??latest?.district)===district)});return {members:members.map(m=>({id:m.bioguideId,name:m.name||m.directOrderName||m.fullName,party:m.party,state:m.state,district:m.district,chamber:(m.terms?.item||[]).at(-1)?.chamber||'',image:m.depiction?.imageUrl||null,profile:`https://www.congress.gov/member/${m.bioguideId}`})),source:'Congress.gov',retrievedAt:new Date().toISOString()}}));
 app.get('/api/sponsored/:id',handler(async req=>{const id=req.params.id;if(!/^[A-Z]\d{6}$/.test(id))throw Error('Invalid Bioguide ID');const d=await congress(`/member/${id}/sponsored-legislation?limit=20`);return {bills:(d.sponsoredLegislation||[]).map(b=>({title:b.title,number:b.number,type:b.type,congress:b.congress,url:b.url?.replace('api.congress.gov/v3/bill/','www.congress.gov/bill/')||null,latestAction:b.latestAction?.text,date:b.latestAction?.actionDate})),source:'Congress.gov'}}));
 function array(v){return v==null?[]:Array.isArray(v)?v:[v]}function text(v){return typeof v==='object'?(v?.['#text']??''):v??''}
